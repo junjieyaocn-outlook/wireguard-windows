@@ -19,6 +19,7 @@ import (
 	"golang.zx2c4.com/wireguard/windows/conf"
 	"golang.zx2c4.com/wireguard/windows/driver"
 	"golang.zx2c4.com/wireguard/windows/elevate"
+	"golang.zx2c4.com/wireguard/windows/portrotate"
 	"golang.zx2c4.com/wireguard/windows/ringlogger"
 	"golang.zx2c4.com/wireguard/windows/services"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
@@ -114,6 +115,22 @@ func (service *tunnelService) Execute(args []string, r <-chan svc.ChangeRequest,
 		return
 	}
 	config.DeduplicateNetworkEntries()
+
+	/* Client-side daily port rotation (see the portrotate package): the server
+	 * rotates its listening port every day at 04:00 local time to 4MMDD. For
+	 * tunnels named "wg_*", rewrite every peer's Endpoint port to today's
+	 * value here at startup as well, so a rotation missed while the machine
+	 * was off is applied on the next start. ListenPort is intentionally left
+	 * untouched (server-side concern).
+	 */
+	if portrotate.TunnelEnabled(config.Name) {
+		if changed, port := applyPortRotation(config, time.Now()); changed > 0 {
+			log.Printf("Port rotation (startup): updated %d peer endpoint(s) to port %d", changed, port)
+			if err := config.Save(true); err != nil {
+				log.Printf("Warning: unable to save rotated configuration: %v", err)
+			}
+		}
+	}
 
 	log.SetPrefix(fmt.Sprintf("[%s] ", config.Name))
 
@@ -221,6 +238,19 @@ func (service *tunnelService) Execute(args []string, r <-chan svc.ChangeRequest,
 
 	changes <- svc.Status{State: serviceState, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 
+	/* Daily port rotation timer: fires at the next 04:00 local time, then
+	 * re-arms itself every 24 hours. The channel stays nil for tunnels that
+	 * do not participate, so the case below never fires for them.
+	 */
+	rotationTimerCh := (<-chan time.Time)(nil)
+	var rotationTimer *time.Timer
+	if portrotate.TunnelEnabled(config.Name) {
+		wait := portrotate.UntilNextRotation(time.Now())
+		rotationTimer = time.NewTimer(wait)
+		rotationTimerCh = rotationTimer.C
+		log.Printf("Daily port rotation scheduled in %v", wait.Round(time.Second))
+	}
+
 	var started bool
 	for {
 		select {
@@ -243,8 +273,40 @@ func (service *tunnelService) Execute(args []string, r <-chan svc.ChangeRequest,
 		case e := <-watcher.errors:
 			serviceError, err = e.serviceError, e.err
 			return
+		case <-rotationTimerCh:
+			changed, port := applyPortRotation(config, time.Now())
+			if changed > 0 {
+				log.Printf("Port rotation: updated %d peer endpoint(s) to port %d, reconnecting", changed, port)
+				if err := config.Save(true); err != nil {
+					log.Printf("Warning: unable to save rotated configuration: %v", err)
+				}
+				if err := adapter.SetConfiguration(config.ToDriverConfiguration()); err != nil {
+					log.Printf("Warning: unable to reapply configuration after port rotation: %v", err)
+				}
+			} else {
+				log.Printf("Port rotation: peer endpoints already on port %d, nothing to do", port)
+			}
+			rotationTimer.Reset(portrotate.UntilNextRotation(time.Now()))
 		}
 	}
+}
+
+// applyPortRotation rewrites the Endpoint port of every peer that has a host
+// set to the rotation port for the given time. It returns the number of peers
+// changed and the port applied. The Endpoint host (IP or DNS name) is left
+// untouched, as is the interface ListenPort.
+func applyPortRotation(config *conf.Config, now time.Time) (changed int, port uint16) {
+	port = portrotate.RotationPort(now)
+	for i := range config.Peers {
+		if config.Peers[i].Endpoint.Host == "" {
+			continue
+		}
+		if config.Peers[i].Endpoint.Port != port {
+			config.Peers[i].Endpoint.Port = port
+			changed++
+		}
+	}
+	return changed, port
 }
 
 func Run(confPath string) error {
